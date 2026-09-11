@@ -650,6 +650,38 @@ def _circle_html(state, active, state_colors, state_labels):
             f'{label}</div>')
 
 
+def count_completed_cycles(states) -> int:
+    """
+    Count completed production cycles ("parts") from a sequence of
+    RED/AMBER/GREEN states.
+
+    A part is one maximal run of non-RED states that contains at least one
+    GREEN sample, i.e. the machine went from idle, did productive work, and
+    (usually) returned to idle. This mirrors the cycle-detection rule already
+    used for ML auto-labelling (see */ml/label_generator.py), just applied to
+    the RAG-classified state sequence instead of raw per-sample thresholds.
+
+    A cycle still in progress at the end of the sequence (no trailing RED) is
+    counted too, since the machine did complete productive work.
+    """
+    count = 0
+    in_cycle = False
+    saw_green = False
+    for s in states:
+        if s == RED:
+            if in_cycle and saw_green:
+                count += 1
+            in_cycle = False
+            saw_green = False
+        else:
+            in_cycle = True
+            if s == GREEN:
+                saw_green = True
+    if in_cycle and saw_green:
+        count += 1
+    return count
+
+
 def _machine_header(m: str):
     meta = MACHINE_META[m]
     color = meta["badge_color"]
@@ -751,6 +783,16 @@ def page_validation():
     m3.metric("Valid %",           f"{dataset_val.valid_pct:.1f}%")
     m4.metric("Avg Grid Freq",     f"{dataset_val.avg_freq:.2f} Hz")
     m5.metric("Avg Phase Imbal.",  f"{dataset_val.avg_phase_imbalance:.3f}")
+
+    st.markdown("#### Production Summary")
+    parts_total = count_completed_cycles(ss("smoothed_states") or [])
+    st.metric(
+        "🔩 Parts Produced (est.)",
+        f"{parts_total:,}",
+        help="One completed idle → active → idle cycle (RED → AMBER/GREEN → RED, "
+             "containing at least one GREEN window) counts as one part. This is "
+             "estimated from the current signature, not a physical part counter.",
+    )
 
     # FFT window inspector
     st.markdown("---")
@@ -897,6 +939,9 @@ def _page_rag_conveyer(df: pd.DataFrame, sc: dict, sl: dict, meta: dict):
         st.markdown(f"**IDLE:** {thr['red_max_rms']:.2f} – {thr['green_min_rms']:.2f} A")
         st.markdown(f"**RUNNING:** I_avg ≥ {thr['green_min_rms']:.2f} A")
         st.caption(f"{n:,} samples · per-sample classification")
+        parts_so_far = count_completed_cycles(sample_states[: idx + 1])
+        parts_total  = count_completed_cycles(sample_states)
+        st.markdown(f"**🔩 Parts:** {parts_so_far} / {parts_total} (est.)")
 
     # ── Live cycle view (±60 s centred on current sample) ─────────────
     st.markdown("---")
@@ -1178,6 +1223,9 @@ def page_rag():
         fft_ref = cur_fft.get("i_avg") or cur_fft.get("i1")
         if fft_ref:
             st.markdown(f"**Cycle freq:** {fft_ref.fundamental_freq * 1000:.1f} mHz")
+        parts_so_far = count_completed_cycles(smoothed_states[: idx + 1])
+        parts_total  = count_completed_cycles(smoothed_states)
+        st.markdown(f"**🔩 Parts:** {parts_so_far} / {parts_total} (est.)")
 
     # ── Row 2: Live time-series + FFT ─────────────────────────────────
     st.markdown("---")
