@@ -65,11 +65,11 @@ from robo.validation                   import DEFAULT_THRESHOLDS as ROBO_VAL_DEF
 from robo.feature_engineering          import compute_features as robo_feat, features_to_dict as robo_feat_dict
 from robo.rag_classifier               import (
     classify as robo_classify,
+    STATE_ORDER as ROBO_STATE_ORDER,
     STATE_COLORS as ROBO_STATE_COLORS,
     STATE_LABELS as ROBO_STATE_LABELS,
     DEFAULT_THRESHOLDS as ROBO_RAG_DEFAULTS,
 )
-from robo.state_manager                import StateManager as robo_StateManager
 from robo.ml.ui                        import render_ml_page as render_robo_ml_page
 
 # ── Milling Machine imports ────────────────────────────────────────────────────
@@ -220,11 +220,12 @@ MACHINE_META = {
         "feat"         : robo_feat,
         "feat_dict"    : robo_feat_dict,
         "classify"     : robo_classify,
-        "StateManager" : robo_StateManager,
+        "StateManager" : None,   # no hysteresis smoothing — each window's load state stands on its own
         "val_defaults" : ROBO_VAL_DEFAULTS,
         "rag_defaults" : ROBO_RAG_DEFAULTS,
         "state_colors" : ROBO_STATE_COLORS,
         "state_labels" : ROBO_STATE_LABELS,
+        "state_order"  : ROBO_STATE_ORDER,
     },
     "milling": {
         "label"        : "Milling Machine",
@@ -411,7 +412,7 @@ def render_sidebar():
     def _page_label(p):
         return {
             "validation": "📋  Validation",
-            "rag":        "🚦  RAG Analysis",
+            "rag":        "📊  Load Analysis" if m == "robo" else "🚦  RAG Analysis",
             "ml":         "🤖  ML Diagnostics",
         }[p]
 
@@ -450,15 +451,21 @@ def render_sidebar():
     vt["max_phase_imbalance"]   = st.sidebar.number_input("Max phase imbalance (CV)", 0.1, 3.0, float(vt["max_phase_imbalance"]),   0.05, key=f"{m}_pi")
     vt["valid_window_fraction"] = st.sidebar.number_input("Valid window fraction",    0.5, 1.0, float(vt["valid_window_fraction"]), 0.05, key=f"{m}_vwf")
 
-    # ── RAG thresholds ────────────────────────────────────────────────
+    # ── Load / RAG thresholds ──────────────────────────────────────────
     st.sidebar.markdown("---")
-    st.sidebar.markdown('<div class="section-label">RAG Thresholds</div>', unsafe_allow_html=True)
     rt = ss("rag_thr")
-    rt["red_max_rms"]      = st.sidebar.number_input("RED max RMS (A)",   0.01, 10.0, float(rt["red_max_rms"]),   0.05, key=f"{m}_rmr")
-    rt["green_min_rms"]    = st.sidebar.number_input("GREEN min RMS (A)", 0.01, 30.0, float(rt["green_min_rms"]), 0.05, key=f"{m}_gmr")
-    rt["green_min_thd"]    = st.sidebar.number_input("GREEN min THD",     0.01, 1.0,  float(rt["green_min_thd"]), 0.01, key=f"{m}_gmt")
-    if "green_min_imbalance" in rt:
-        rt["green_min_imbalance"] = st.sidebar.number_input("GREEN min imbalance", 0.01, 2.0, float(rt["green_min_imbalance"]), 0.01, key=f"{m}_gmi")
+    if m == "robo":
+        st.sidebar.markdown('<div class="section-label">Load Thresholds</div>', unsafe_allow_html=True)
+        rt["off_max_rms"]  = st.sidebar.number_input("OFF max RMS (A)",   0.0, 10.0, float(rt["off_max_rms"]),  0.005, key=f"{m}_omr")
+        rt["idle_max_rms"] = st.sidebar.number_input("IDLE max RMS (A)",  0.0, 10.0, float(rt["idle_max_rms"]), 0.005, key=f"{m}_imr")
+        rt["peak_min_rms"] = st.sidebar.number_input("PEAK min RMS (A)",  0.0, 10.0, float(rt["peak_min_rms"]), 0.005, key=f"{m}_pmr")
+    else:
+        st.sidebar.markdown('<div class="section-label">RAG Thresholds</div>', unsafe_allow_html=True)
+        rt["red_max_rms"]      = st.sidebar.number_input("RED max RMS (A)",   0.01, 10.0, float(rt["red_max_rms"]),   0.05, key=f"{m}_rmr")
+        rt["green_min_rms"]    = st.sidebar.number_input("GREEN min RMS (A)", 0.01, 30.0, float(rt["green_min_rms"]), 0.05, key=f"{m}_gmr")
+        rt["green_min_thd"]    = st.sidebar.number_input("GREEN min THD",     0.01, 1.0,  float(rt["green_min_thd"]), 0.01, key=f"{m}_gmt")
+        if "green_min_imbalance" in rt:
+            rt["green_min_imbalance"] = st.sidebar.number_input("GREEN min imbalance", 0.01, 2.0, float(rt["green_min_imbalance"]), 0.01, key=f"{m}_gmi")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -494,8 +501,11 @@ def run_pipeline(df: pd.DataFrame):
     with st.spinner("Classifying states…"):
         raw_states = [meta["classify"](f, thresholds=ss("rag_thr")).state for f in features_cache]
         raw_confs  = [meta["classify"](f, thresholds=ss("rag_thr")).confidence for f in features_cache]
-        sm = meta["StateManager"](min_consecutive=3)
-        smoothed = sm.run_batch(raw_states, raw_confs)
+        if meta["StateManager"] is not None:
+            sm = meta["StateManager"](min_consecutive=3)
+            smoothed = sm.run_batch(raw_states, raw_confs)
+        else:
+            smoothed = raw_states
 
     ss_set("windows_proc",    windows_proc)
     ss_set("fft_cache",       fft_cache)
@@ -631,6 +641,59 @@ def fig_state_timeline(smoothed_states, win_centres, state_colors, state_labels,
                              "🟢 " + state_labels.get(GREEN, "Load")]),
         template="plotly_dark", height=160,
         margin=dict(l=100, r=20, t=36, b=24), showlegend=False,
+        font=dict(size=11), plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
+
+
+def fig_load_timeline(states, win_centres, state_colors, state_labels, state_order, current_idx=None):
+    """Generic N-state timeline strip, used by the robo Load Analysis page."""
+    state_num = {s: i for i, s in enumerate(state_order)}
+    nums = [state_num.get(s, 0) for s in states]
+    n    = len(nums)
+    x    = list(range(n))
+
+    def _fmt(t):
+        try:
+            return pd.Timestamp(t).strftime("%b %d  %H:%M:%S")
+        except Exception:
+            return str(t)
+    ts_labels = [_fmt(t) for t in win_centres]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=x, y=nums, mode="markers",
+        marker=dict(color=[state_colors.get(s, "#888") for s in states],
+                    size=7, symbol="square"),
+        text=[state_labels.get(s, s) for s in states],
+        customdata=ts_labels,
+        hovertemplate="%{text}<br>%{customdata}<extra></extra>",
+    ))
+    if current_idx is not None and current_idx < n:
+        fig.add_vline(x=current_idx, line_color="white",
+                      line_width=1.5, line_dash="dot")
+
+    if n > 1:
+        k = min(8, n)
+        idxs = [int(round(i)) for i in np.linspace(0, n - 1, k)]
+        xaxis = dict(title="Window sequence (time →)",
+                     tickvals=idxs, ticktext=[ts_labels[i] for i in idxs],
+                     tickangle=0)
+    else:
+        xaxis = dict(title="Window sequence (time →)")
+
+    icons = ["🔴", "🟡", "🟢", "💗"]
+    fig.update_layout(
+        title="Load Timeline",
+        xaxis=xaxis,
+        yaxis=dict(
+            tickvals=list(range(len(state_order))),
+            ticktext=[f"{icons[i % len(icons)]} {state_labels.get(s, s)}"
+                      for i, s in enumerate(state_order)],
+        ),
+        template="plotly_dark", height=180,
+        margin=dict(l=110, r=20, t=36, b=24), showlegend=False,
         font=dict(size=11), plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
     )
@@ -784,15 +847,16 @@ def page_validation():
     m4.metric("Avg Grid Freq",     f"{dataset_val.avg_freq:.2f} Hz")
     m5.metric("Avg Phase Imbal.",  f"{dataset_val.avg_phase_imbalance:.3f}")
 
-    st.markdown("#### Production Summary")
-    parts_total = count_completed_cycles(ss("smoothed_states") or [])
-    st.metric(
-        "🔩 Parts Produced (est.)",
-        f"{parts_total:,}",
-        help="One completed idle → active → idle cycle (RED → AMBER/GREEN → RED, "
-             "containing at least one GREEN window) counts as one part. This is "
-             "estimated from the current signature, not a physical part counter.",
-    )
+    if m != "robo":
+        st.markdown("#### Production Summary")
+        parts_total = count_completed_cycles(ss("smoothed_states") or [])
+        st.metric(
+            "🔩 Parts Produced (est.)",
+            f"{parts_total:,}",
+            help="One completed idle → active → idle cycle (RED → AMBER/GREEN → RED, "
+                 "containing at least one GREEN window) counts as one part. This is "
+                 "estimated from the current signature, not a physical part counter.",
+        )
 
     # FFT window inspector
     st.markdown("---")
@@ -1095,6 +1159,157 @@ def _per_sample_states(df: pd.DataFrame, thresholds: dict) -> list[str]:
     return states
 
 
+def _page_load_robo(meta: dict, sc: dict, sl: dict):
+    """
+    Load Analysis for the EPSON Robot: OFF / IDLE / NORMAL LOAD / PEAK LOAD.
+
+    Each window is classified directly from its own current level — no
+    hysteresis / anti-flicker smoothing — so genuine load spikes (PEAK)
+    show up immediately instead of being filtered out as noise.
+    """
+    state_order = meta["state_order"]
+
+    if ss("smoothed_states") is None:
+        with st.spinner("Running load analysis pipeline…"):
+            run_pipeline(_default_analysis_view("robo", ss("df")))
+        st.rerun()
+
+    df           = ss("df")
+    windows_proc = ss("windows_proc")
+    load_states  = ss("smoothed_states")   # identical to raw_states for robo (no smoothing)
+    features_cache = ss("features_cache")
+    val_results  = ss("val_results")
+    fft_cache    = ss("fft_cache")
+    win_centres  = ss("win_centres")
+    n_windows    = len(windows_proc)
+
+    # ── Playback controls ──────────────────────────────────────────────
+    ctrl1, ctrl2, ctrl3 = st.columns([1, 2, 2])
+    with ctrl1:
+        if st.button("⏮ Reset", key="robo_reset"):
+            ss_set("play_idx", 0)
+            ss_set("playing",  False)
+            st.rerun()
+        play_label = "⏸ Pause" if ss("playing") else "▶ Play"
+        if st.button(play_label, key="robo_play"):
+            ss_set("playing", not ss("playing"))
+            st.rerun()
+    with ctrl2:
+        speed = st.slider("Speed (steps/sec)", 1, 50, 10, key="robo_speed")
+    with ctrl3:
+        _min_samp = 8
+        _last_full = n_windows - 1
+        for _j in range(n_windows - 1, -1, -1):
+            if len(windows_proc[_j].data) >= _min_samp:
+                _last_full = _j
+                break
+        manual_idx = st.slider("Jump to window", 0, _last_full,
+                                min(ss("play_idx"), _last_full), key="robo_jump")
+        if manual_idx != ss("play_idx") and not ss("playing"):
+            ss_set("play_idx", manual_idx)
+
+    idx = max(0, min(ss("play_idx"), _last_full))
+    cur_state    = load_states[idx]
+    cur_features = features_cache[idx]
+    cur_val      = val_results[idx]
+    cur_window   = windows_proc[idx]
+    cur_fft      = fft_cache[idx]
+
+    # ── Row 1: Load circles | Features | Window info ────────────────────
+    col_lights, col_feat, col_info = st.columns([2, 2, 2])
+
+    with col_lights:
+        st.markdown("#### Load State")
+        html = '<div style="display:flex;gap:12px;justify-content:center;">'
+        for state in state_order:
+            html += _circle_html(state, state == cur_state, sc, sl)
+        html += '</div>'
+        st.markdown(html, unsafe_allow_html=True)
+        st.markdown(
+            f'<div style="text-align:center;font-size:1.1rem;margin-top:10px;">'
+            f'<b style="color:{sc.get(cur_state,"#fff")};">{sl.get(cur_state, cur_state)}</b>'
+            f'</div>', unsafe_allow_html=True,
+        )
+
+    with col_feat:
+        st.markdown("#### Features")
+        fd = meta["feat_dict"](cur_features)
+
+        def _mb(label, value, unit=""):
+            return (f'<div class="metric-box">'
+                    f'<div class="metric-label">{label}</div>'
+                    f'<div class="metric-value">{value}{unit}</div>'
+                    f'</div>')
+
+        st.markdown(
+            _mb("RMS I_avg",      f"{fd['rms_i_avg']:.3f}", " A") +
+            _mb("RMS I1",         f"{fd['rms_i1']:.3f}",    " A") +
+            _mb("Variance I_avg", f"{fd['variance_i_avg']:.5f}", " A²") +
+            _mb("THD (proxy)",    f"{fd['thd']:.3f}"),
+            unsafe_allow_html=True,
+        )
+
+    with col_info:
+        st.markdown("#### Window")
+        badge = "✅ VALID" if cur_val.is_valid else "❌ INVALID"
+        st.markdown(f'<div style="font-size:1.6rem;text-align:center;">{badge}</div>',
+                    unsafe_allow_html=True)
+        st.markdown(f"**Window:** {idx + 1} / {n_windows}")
+        st.markdown(f"**Start:** {cur_window.start_time.strftime('%H:%M:%S')}")
+        st.markdown(f"**End:**   {cur_window.end_time.strftime('%H:%M:%S')}")
+        st.markdown(f"**Samples:** {len(cur_window.data)}")
+        st.markdown(f"**Load state:** {sl.get(cur_state, cur_state)}")
+        if not cur_val.is_valid:
+            st.caption(f"⚠️ {cur_val.failure_reason}")
+
+    # ── Row 2: Live time-series + FFT ─────────────────────────────────
+    st.markdown("---")
+    col_ts, col_fft_panel = st.columns([3, 2])
+    with col_ts:
+        st.markdown("#### Time-Series")
+        ctx_sec = ss("window_size_sec") * 3
+        df_zoom = df[(df["timestamp"] >= cur_window.start_time - pd.Timedelta(seconds=ctx_sec)) &
+                     (df["timestamp"] <= cur_window.end_time   + pd.Timedelta(seconds=ctx_sec))]
+        st.plotly_chart(
+            fig_time_series(df_zoom, cur_window.start_time, cur_window.end_time),
+            width='stretch',
+        )
+    with col_fft_panel:
+        st.markdown("#### FFT Spectrum")
+        st.plotly_chart(
+            fig_fft(cur_fft, sample_rate=meta["sample_rate"](df)),
+            width='stretch',
+        )
+
+    # ── Row 3: Load timeline + summary ───────────────────────────────
+    st.markdown("---")
+    st.markdown("#### Timeline")
+    st.plotly_chart(
+        fig_load_timeline(load_states, win_centres, sc, sl, state_order, current_idx=idx),
+        width='stretch',
+    )
+
+    counts = {s: 0 for s in state_order}
+    for s in load_states:
+        counts[s] += 1
+    tot = max(1, len(load_states))
+    cols = st.columns(len(state_order))
+    icons = ["🔴", "🟡", "🟢", "💗"]
+    for col, state, icon in zip(cols, state_order, icons):
+        col.metric(f"{icon} {sl.get(state, state)}", f"{counts[state]:,}",
+                   f"{counts[state]/tot*100:.1f}%")
+
+    # ── Playback advance ───────────────────────────────────────────────
+    if ss("playing"):
+        if idx < n_windows - 1:
+            ss_set("play_idx", idx + 1)
+            time.sleep(max(0.02, 1.0 / speed))
+            st.rerun()
+        else:
+            ss_set("playing", False)
+            st.success("✅ Playback complete!")
+
+
 def page_rag():
     m    = st.session_state.current_machine
     meta = MACHINE_META[m]
@@ -1102,10 +1317,15 @@ def page_rag():
     sl   = meta["state_labels"]
 
     _machine_header(m)
-    st.markdown("## RAG State Analysis")
+    st.markdown("## Load Analysis" if m == "robo" else "## RAG State Analysis")
 
     # Auto-load bundled data so this page works even if opened first.
     if not ensure_data_loaded(m):
+        return
+
+    # ── Robot: direct per-window load classification, no state analysis ──
+    if m == "robo":
+        _page_load_robo(meta, sc, sl)
         return
 
     # ── Conveyer: per-sample classification (no window pipeline needed) ──
