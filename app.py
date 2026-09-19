@@ -81,11 +81,11 @@ from milling.validation               import DEFAULT_THRESHOLDS as MILL_VAL_DEFA
 from milling.feature_engineering       import compute_features as mill_feat, features_to_dict as mill_feat_dict
 from milling.rag_classifier            import (
     classify as mill_classify,
+    STATE_ORDER as MILL_STATE_ORDER,
     STATE_COLORS as MILL_STATE_COLORS,
     STATE_LABELS as MILL_STATE_LABELS,
     DEFAULT_THRESHOLDS as MILL_RAG_DEFAULTS,
 )
-from milling.state_manager             import StateManager as mill_StateManager
 from milling.ml.ui                     import render_ml_page as render_mill_ml_page
 
 from pathlib import Path
@@ -243,11 +243,12 @@ MACHINE_META = {
         "feat"         : mill_feat,
         "feat_dict"    : mill_feat_dict,
         "classify"     : mill_classify,
-        "StateManager" : mill_StateManager,
+        "StateManager" : None,   # no hysteresis smoothing — each window's load state stands on its own
         "val_defaults" : MILL_VAL_DEFAULTS,
         "rag_defaults" : MILL_RAG_DEFAULTS,
         "state_colors" : MILL_STATE_COLORS,
         "state_labels" : MILL_STATE_LABELS,
+        "state_order"  : MILL_STATE_ORDER,
     },
 }
 
@@ -412,7 +413,7 @@ def render_sidebar():
     def _page_label(p):
         return {
             "validation": "📋  Validation",
-            "rag":        "📊  Load Analysis" if m == "robo" else "🚦  RAG Analysis",
+            "rag":        "📊  Load Analysis" if m in ("robo", "milling") else "🚦  RAG Analysis",
             "ml":         "🤖  ML Diagnostics",
         }[p]
 
@@ -454,11 +455,12 @@ def render_sidebar():
     # ── Load / RAG thresholds ──────────────────────────────────────────
     st.sidebar.markdown("---")
     rt = ss("rag_thr")
-    if m == "robo":
+    if m in ("robo", "milling"):
+        step = 0.005 if m == "robo" else 0.05
         st.sidebar.markdown('<div class="section-label">Load Thresholds</div>', unsafe_allow_html=True)
-        rt["off_max_rms"]  = st.sidebar.number_input("OFF max RMS (A)",   0.0, 10.0, float(rt["off_max_rms"]),  0.005, key=f"{m}_omr")
-        rt["idle_max_rms"] = st.sidebar.number_input("IDLE max RMS (A)",  0.0, 10.0, float(rt["idle_max_rms"]), 0.005, key=f"{m}_imr")
-        rt["peak_min_rms"] = st.sidebar.number_input("PEAK min RMS (A)",  0.0, 10.0, float(rt["peak_min_rms"]), 0.005, key=f"{m}_pmr")
+        rt["off_max_rms"]  = st.sidebar.number_input("OFF max RMS (A)",   0.0, 10.0, float(rt["off_max_rms"]),  step, key=f"{m}_omr")
+        rt["idle_max_rms"] = st.sidebar.number_input("IDLE max RMS (A)",  0.0, 10.0, float(rt["idle_max_rms"]), step, key=f"{m}_imr")
+        rt["peak_min_rms"] = st.sidebar.number_input("PEAK min RMS (A)",  0.0, 10.0, float(rt["peak_min_rms"]), step, key=f"{m}_pmr")
     else:
         st.sidebar.markdown('<div class="section-label">RAG Thresholds</div>', unsafe_allow_html=True)
         rt["red_max_rms"]      = st.sidebar.number_input("RED max RMS (A)",   0.01, 10.0, float(rt["red_max_rms"]),   0.05, key=f"{m}_rmr")
@@ -847,7 +849,7 @@ def page_validation():
     m4.metric("Avg Grid Freq",     f"{dataset_val.avg_freq:.2f} Hz")
     m5.metric("Avg Phase Imbal.",  f"{dataset_val.avg_phase_imbalance:.3f}")
 
-    if m != "robo":
+    if m not in ("robo", "milling"):
         st.markdown("#### Production Summary")
         parts_total = count_completed_cycles(ss("smoothed_states") or [])
         st.metric(
@@ -1159,24 +1161,27 @@ def _per_sample_states(df: pd.DataFrame, thresholds: dict) -> list[str]:
     return states
 
 
-def _page_load_robo(meta: dict, sc: dict, sl: dict):
+def _page_load_analysis(m: str, meta: dict, sc: dict, sl: dict):
     """
-    Load Analysis for the EPSON Robot: OFF / IDLE / NORMAL LOAD / PEAK LOAD.
+    Load Analysis: OFF / IDLE / NORMAL LOAD / PEAK LOAD.
 
     Each window is classified directly from its own current level — no
     hysteresis / anti-flicker smoothing — so genuine load spikes (PEAK)
     show up immediately instead of being filtered out as noise.
+
+    Shared by the EPSON Robot and Milling Machine pages, which both use
+    this 4-state load model.
     """
     state_order = meta["state_order"]
 
     if ss("smoothed_states") is None:
         with st.spinner("Running load analysis pipeline…"):
-            run_pipeline(_default_analysis_view("robo", ss("df")))
+            run_pipeline(_default_analysis_view(m, ss("df")))
         st.rerun()
 
     df           = ss("df")
     windows_proc = ss("windows_proc")
-    load_states  = ss("smoothed_states")   # identical to raw_states for robo (no smoothing)
+    load_states  = ss("smoothed_states")   # identical to raw_states (no smoothing)
     features_cache = ss("features_cache")
     val_results  = ss("val_results")
     fft_cache    = ss("fft_cache")
@@ -1186,16 +1191,16 @@ def _page_load_robo(meta: dict, sc: dict, sl: dict):
     # ── Playback controls ──────────────────────────────────────────────
     ctrl1, ctrl2, ctrl3 = st.columns([1, 2, 2])
     with ctrl1:
-        if st.button("⏮ Reset", key="robo_reset"):
+        if st.button("⏮ Reset", key=f"{m}_reset"):
             ss_set("play_idx", 0)
             ss_set("playing",  False)
             st.rerun()
         play_label = "⏸ Pause" if ss("playing") else "▶ Play"
-        if st.button(play_label, key="robo_play"):
+        if st.button(play_label, key=f"{m}_play"):
             ss_set("playing", not ss("playing"))
             st.rerun()
     with ctrl2:
-        speed = st.slider("Speed (steps/sec)", 1, 50, 10, key="robo_speed")
+        speed = st.slider("Speed (steps/sec)", 1, 50, 10, key=f"{m}_speed")
     with ctrl3:
         _min_samp = 8
         _last_full = n_windows - 1
@@ -1204,7 +1209,7 @@ def _page_load_robo(meta: dict, sc: dict, sl: dict):
                 _last_full = _j
                 break
         manual_idx = st.slider("Jump to window", 0, _last_full,
-                                min(ss("play_idx"), _last_full), key="robo_jump")
+                                min(ss("play_idx"), _last_full), key=f"{m}_jump")
         if manual_idx != ss("play_idx") and not ss("playing"):
             ss_set("play_idx", manual_idx)
 
@@ -1317,15 +1322,15 @@ def page_rag():
     sl   = meta["state_labels"]
 
     _machine_header(m)
-    st.markdown("## Load Analysis" if m == "robo" else "## RAG State Analysis")
+    st.markdown("## Load Analysis" if m in ("robo", "milling") else "## RAG State Analysis")
 
     # Auto-load bundled data so this page works even if opened first.
     if not ensure_data_loaded(m):
         return
 
-    # ── Robot: direct per-window load classification, no state analysis ──
-    if m == "robo":
-        _page_load_robo(meta, sc, sl)
+    # ── Robot / Milling: direct per-window load classification (4-state) ──
+    if m in ("robo", "milling"):
+        _page_load_analysis(m, meta, sc, sl)
         return
 
     # ── Conveyer: per-sample classification (no window pipeline needed) ──

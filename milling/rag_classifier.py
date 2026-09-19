@@ -1,26 +1,34 @@
 """
 milling/rag_classifier.py
-Rule-based RAG classifier for the Milling Machine.
+Rule-based load classifier for the Milling Machine.
 
-States (re-calibrated against actual data)
-------------------------------------------
-RED   – Idle    : Machine off / control circuitry only. I_Avg < ~1.0 A.
-AMBER – No Load : Spindle/feed energised but not cutting.
-                  I_Avg ~1.0 – 3.0 A.
-GREEN – Cutting : Active material removal, all three phases loaded.
-                  I_Avg ≥ ~3.0 A (peaks to ~34 A on heavy cuts).
+States (calibrated from the observed I_Avg distribution, at the default
+20 s analysis window)
+-----------------------------------------------------------------------
+OFF    – red    : Machine powered down / control circuitry only.
+                  I_Avg <= 0.95 A (isolated low cluster, ~3% of windows).
+IDLE   – yellow : Spindle/feed energised but not cutting (no-load plateau).
+                  0.95 < I_Avg <= 1.20 A (tight cluster around ~1.05 A).
+NORMAL – green  : Active material removal at typical load.
+                  1.20 < I_Avg < 4.00 A (bulk of the running data, incl.
+                  the ramp-up/light-cut transition zone).
+PEAK   – pink   : Heavy cut / high load.
+                  I_Avg >= 4.00 A (top ~10% of running windows).
 
-Observed current ranges (single milling data file)
---------------------------------------------------
-  Idle     :  I_Avg < 1.0 A   (~3.5% of samples)
-  No Load  :  I_Avg 1.0 – 3.0 A
-  Cutting  :  I_Avg 3.0 – 34 A (median running draw ~3.2 A)
+Note: these window-level thresholds are tuned for the default 20 s
+analysis window. Widening the window compresses the RMS range further
+towards the mean, so the thresholds may need adjusting (via the sidebar)
+for very different window sizes.
 
-Key discriminators
-------------------
-  1. I_Avg level   – primary separator for all three states
-  2. Variance      – cutting windows show higher within-window variance
-  3. Phase balance – three balanced phases when running (CV ~0.13)
+Observed current ranges (single milling data file, 20 s / 50% overlap windows)
+--------------------------------------------------------------------------
+  I_Avg (windowed RMS): 0.71 – 9.87 A
+  Raw per-sample I_Avg : 0.06 – 34 A (peaks flattened out by windowing)
+
+This is a direct per-window load classification with no temporal
+smoothing / hysteresis — each window is judged independently on its own
+current level, since a genuine load spike (PEAK) is a real signal we
+want to see, not noise to be filtered out.
 """
 
 from __future__ import annotations
@@ -28,23 +36,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from .feature_engineering import WindowFeatures
 
-RED   = "RED"
-AMBER = "AMBER"
-GREEN = "GREEN"
+OFF    = "OFF"
+IDLE   = "IDLE"
+NORMAL = "NORMAL"
+PEAK   = "PEAK"
 
-STATE_COLORS = {RED: "#e74c3c", AMBER: "#f39c12", GREEN: "#27ae60"}
-STATE_LABELS = {RED: "Idle", AMBER: "No Load", GREEN: "Cutting"}
+STATE_ORDER  = [OFF, IDLE, NORMAL, PEAK]
+STATE_COLORS = {OFF: "#e74c3c", IDLE: "#f1c40f", NORMAL: "#27ae60", PEAK: "#e91e8c"}
+STATE_LABELS = {OFF: "OFF", IDLE: "IDLE", NORMAL: "NORMAL LOAD", PEAK: "PEAK LOAD"}
 
 # ── Defaults tuned to observed data ───────────────────────────────────────────
 DEFAULT_THRESHOLDS = dict(
-    # RED (Idle) ─────────────────────────────────────────────────────────
-    red_max_rms      = 1.0,     # A  – I_Avg RMS below this → Idle
-
-    # GREEN (Cutting) ────────────────────────────────────────────────────
-    green_min_rms    = 3.0,     # A  – I_Avg RMS above this → candidate Cutting
-    green_min_thd    = 0.05,    # –  – any THD detected from cutting load
-    green_min_variance = 0.05,  # A² – within-window variance from cutting dynamics
-    green_min_imbalance = 0.15, # CV – phase imbalance indicator
+    off_max_rms  = 0.95,   # A – I_Avg RMS at/below this → OFF
+    idle_max_rms = 1.20,   # A – I_Avg RMS at/below this (and above off_max) → IDLE
+    peak_min_rms = 4.00,   # A – I_Avg RMS at/above this → PEAK LOAD
 )
 
 
@@ -61,82 +66,72 @@ def classify(
     thresholds: dict | None = None,
 ) -> ClassificationResult:
     """
-    Classify one window's features into RED / AMBER / GREEN.
+    Classify one window's features into OFF / IDLE / NORMAL / PEAK load.
 
     Decision logic (in order):
-      1. RMS < red_max_rms                           → RED  (HALT)
-      2. RMS >= green_min_rms  AND phase balance OK  → GREEN (RUNNING)
-      3. RMS >= green_min_rms  AND RMS >> threshold  → GREEN (dominant signal)
-      4. Everything else                             → AMBER (IDLE)
+      1. RMS <= off_max_rms                         → OFF
+      2. RMS <= idle_max_rms                         → IDLE
+      3. RMS <  peak_min_rms                         → NORMAL LOAD
+      4. RMS >= peak_min_rms                         → PEAK LOAD
     """
     thr = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
 
-    rms   = features.rms_i_avg
-    var   = features.variance_i_avg
-    thd   = features.thd
-    imbal = features.phase_imbalance
+    rms = features.rms_i_avg
+    var = features.variance_i_avg
+    thd = features.thd
 
     def clamp(x, lo=0.0, hi=1.0):
         return max(lo, min(hi, x))
 
-    # ── Normalised sub-scores (all in 0–1) ────────────────────────────────
-    rms_score  = clamp(rms   / max(thr["green_min_rms"],       1e-9))
-    var_score  = clamp(var   / max(thr["green_min_variance"],   1e-9))
-    thd_score  = clamp(thd   / max(thr["green_min_thd"],        1e-9))
-    imb_score  = clamp(imbal / max(thr["green_min_imbalance"],  1e-9))
-
     scores = dict(
-        rms      = round(rms_score, 3),
-        variance = round(var_score, 3),
-        thd      = round(thd_score, 3),
-        imbalance= round(imb_score, 3),
+        rms      = round(rms, 4),
+        variance = round(var, 5),
+        thd      = round(thd, 3),
     )
 
-    # ── RED: very low RMS ─────────────────────────────────────────────────
-    if rms <= thr["red_max_rms"]:
-        confidence = clamp(1.0 - rms / max(thr["red_max_rms"], 1e-9))
+    off_max  = thr["off_max_rms"]
+    idle_max = thr["idle_max_rms"]
+    peak_min = thr["peak_min_rms"]
+
+    # ── OFF: no meaningful draw ────────────────────────────────────────────
+    if rms <= off_max:
+        confidence = clamp(1.0 - rms / max(off_max, 1e-9))
         return ClassificationResult(
-            state      = RED,
+            state      = OFF,
             confidence = round(confidence, 3),
-            reason     = f"RMS={rms:.3f} A <= {thr['red_max_rms']} A (Idle threshold)",
+            reason     = f"RMS={rms:.4f} A <= {off_max} A (OFF threshold)",
             scores     = scores,
         )
 
-    # ── GREEN: RMS above running threshold + at least one quality indicator ──
-    if rms >= thr["green_min_rms"]:
-        intensity = max(thd_score, var_score, imb_score)
+    # ── IDLE: energised, minimal load ──────────────────────────────────────
+    if rms <= idle_max:
+        span = max(idle_max - off_max, 1e-9)
+        confidence = clamp((idle_max - rms) / span)
+        return ClassificationResult(
+            state      = IDLE,
+            confidence = round(confidence, 3),
+            reason     = f"RMS={rms:.4f} A in IDLE band ({off_max}, {idle_max}] A",
+            scores     = scores,
+        )
 
-        if intensity >= 0.3:
-            confidence = clamp((rms_score + intensity) / 2.0)
-            parts = [f"RMS={rms:.3f} A >= {thr['green_min_rms']} A"]
-            if thd   >= thr["green_min_thd"]:        parts.append(f"THD={thd:.3f}")
-            if var   >= thr["green_min_variance"]:   parts.append(f"Var={var:.4f}")
-            if imbal >= thr["green_min_imbalance"]:  parts.append(f"Imb={imbal:.2f}")
-            return ClassificationResult(
-                state      = GREEN,
-                confidence = round(confidence, 3),
-                reason     = "; ".join(parts),
-                scores     = scores,
-            )
+    # ── PEAK: high / peak load ──────────────────────────────────────────────
+    if rms >= peak_min:
+        span = max(peak_min * 0.15, 1e-9)
+        confidence = clamp((rms - peak_min) / span)
+        return ClassificationResult(
+            state      = PEAK,
+            confidence = round(confidence, 3),
+            reason     = f"RMS={rms:.4f} A >= {peak_min} A (PEAK threshold)",
+            scores     = scores,
+        )
 
-        # RMS clearly above threshold even without secondary indicators
-        if rms >= thr["green_min_rms"] * 1.10:
-            return ClassificationResult(
-                state      = GREEN,
-                confidence = round(clamp(rms_score * 0.85), 3),
-                reason     = f"RMS={rms:.3f} A >> threshold (3-phase motor dominant)",
-                scores     = scores,
-            )
-
-    # ── AMBER: intermediate zone (IDLE – other equipment only) ────────────
-    span = max(thr["green_min_rms"] - thr["red_max_rms"], 1e-9)
-    confidence = clamp((rms - thr["red_max_rms"]) / span)
+    # ── NORMAL: typical operating load ──────────────────────────────────────
+    span   = max(peak_min - idle_max, 1e-9)
+    centre = (idle_max + peak_min) / 2.0
+    confidence = clamp(1.0 - abs(rms - centre) / (span / 2.0))
     return ClassificationResult(
-        state      = AMBER,
+        state      = NORMAL,
         confidence = round(confidence, 3),
-        reason     = (
-            f"RMS={rms:.3f} A in No-Load band "
-            f"[{thr['red_max_rms']:.2f}, {thr['green_min_rms']:.2f}] A"
-        ),
+        reason     = f"RMS={rms:.4f} A in NORMAL LOAD band ({idle_max}, {peak_min}) A",
         scores     = scores,
     )
