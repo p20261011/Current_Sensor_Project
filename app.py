@@ -1191,16 +1191,16 @@ def _page_load_analysis(m: str, meta: dict, sc: dict, sl: dict):
     # ── Playback controls ──────────────────────────────────────────────
     ctrl1, ctrl2, ctrl3 = st.columns([1, 2, 2])
     with ctrl1:
-        if st.button("⏮ Reset", key=f"{m}_reset"):
+        if st.button("⏮ Reset"):
             ss_set("play_idx", 0)
             ss_set("playing",  False)
             st.rerun()
         play_label = "⏸ Pause" if ss("playing") else "▶ Play"
-        if st.button(play_label, key=f"{m}_play"):
+        if st.button(play_label):
             ss_set("playing", not ss("playing"))
             st.rerun()
     with ctrl2:
-        speed = st.slider("Speed (steps/sec)", 1, 50, 10, key=f"{m}_speed")
+        speed = st.slider("Speed (steps/sec)", 1, 50, 10)
     with ctrl3:
         _min_samp = 8
         _last_full = n_windows - 1
@@ -1209,7 +1209,7 @@ def _page_load_analysis(m: str, meta: dict, sc: dict, sl: dict):
                 _last_full = _j
                 break
         manual_idx = st.slider("Jump to window", 0, _last_full,
-                                min(ss("play_idx"), _last_full), key=f"{m}_jump")
+                                min(ss("play_idx"), _last_full))
         if manual_idx != ss("play_idx") and not ss("playing"):
             ss_set("play_idx", manual_idx)
 
