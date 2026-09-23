@@ -448,13 +448,19 @@ def render_sidebar():
     st.sidebar.markdown("---")
     st.sidebar.markdown('<div class="section-label">Validation Thresholds</div>', unsafe_allow_html=True)
     vt = ss("val_thr")
+    old_vt = dict(vt)
     vt["freq_tolerance_hz"]     = st.sidebar.number_input("Freq tolerance (Hz)",      0.1, 2.0, float(vt["freq_tolerance_hz"]),     0.1,  key=f"{m}_ft")
     vt["max_phase_imbalance"]   = st.sidebar.number_input("Max phase imbalance (CV)", 0.1, 3.0, float(vt["max_phase_imbalance"]),   0.05, key=f"{m}_pi")
     vt["valid_window_fraction"] = st.sidebar.number_input("Valid window fraction",    0.5, 1.0, float(vt["valid_window_fraction"]), 0.05, key=f"{m}_vwf")
+    if vt != old_vt:
+        # Cheap re-validate only — leaves windows/FFT/features/classification untouched.
+        ss_set("val_results", None)
+        ss_set("dataset_val", None)
 
     # ── Load / RAG thresholds ──────────────────────────────────────────
     st.sidebar.markdown("---")
     rt = ss("rag_thr")
+    old_rt = dict(rt)
     if m in ("robo", "milling"):
         step = 0.005 if m == "robo" else 0.05
         st.sidebar.markdown('<div class="section-label">Load Thresholds</div>', unsafe_allow_html=True)
@@ -468,6 +474,10 @@ def render_sidebar():
         rt["green_min_thd"]    = st.sidebar.number_input("GREEN min THD",     0.01, 1.0,  float(rt["green_min_thd"]), 0.01, key=f"{m}_gmt")
         if "green_min_imbalance" in rt:
             rt["green_min_imbalance"] = st.sidebar.number_input("GREEN min imbalance", 0.01, 2.0, float(rt["green_min_imbalance"]), 0.01, key=f"{m}_gmi")
+    if rt != old_rt:
+        # Cheap reclassify only — leaves windows/FFT/features/validation untouched.
+        ss_set("raw_states", None)
+        ss_set("smoothed_states", None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -475,50 +485,74 @@ def render_sidebar():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_pipeline(df: pd.DataFrame):
-    """Process windows → FFT → validation → features → classification for the active machine."""
+    """
+    Process windows → FFT → features → validation → classification for the
+    active machine, in three independently-cached stages so that a threshold
+    edit (validation or RAG/load) only redoes its own cheap stage instead of
+    forcing a full windows+FFT recompute:
+
+      1. Windowing + FFT + features — runs only while windows_proc is empty.
+      2. Validation                 — runs only while val_results is empty.
+      3. Classification             — runs only while smoothed_states is empty.
+
+    render_sidebar() clears just the relevant stage(s) when its threshold
+    dict changes; ss_invalidate() clears all three (window size / machine /
+    data change).
+    """
     m    = st.session_state.current_machine
     meta = MACHINE_META[m]
     sr   = meta["sample_rate"](df)
 
-    with st.spinner("Generating windows…"):
-        windows = meta["gen_windows"](df, window_size_sec=ss("window_size_sec"), overlap=0.5, sample_rate=sr)
+    if ss("windows_proc") is None:
+        with st.spinner("Generating windows…"):
+            windows = meta["gen_windows"](df, window_size_sec=ss("window_size_sec"), overlap=0.5, sample_rate=sr)
 
-    # Sub-sample for very large datasets
-    if len(windows) > MAX_WINDOWS:
-        step = len(windows) // MAX_WINDOWS
-        windows_proc = windows[::step]
-    else:
-        windows_proc = windows
-
-    with st.spinner(f"Computing FFT for {len(windows_proc)} windows…"):
-        fft_cache = meta["batch_fft"](windows_proc, sample_rate=sr)
-
-    with st.spinner("Validating windows…"):
-        val_results = [meta["val_win"](w.data, thresholds=ss("val_thr")) for w in windows_proc]
-        dataset_val = meta["val_ds"](windows_proc, thresholds=ss("val_thr"))
-
-    with st.spinner("Engineering features…"):
-        features_cache = [meta["feat"](w.data, f) for w, f in zip(windows_proc, fft_cache)]
-
-    with st.spinner("Classifying states…"):
-        raw_states = [meta["classify"](f, thresholds=ss("rag_thr")).state for f in features_cache]
-        raw_confs  = [meta["classify"](f, thresholds=ss("rag_thr")).confidence for f in features_cache]
-        if meta["StateManager"] is not None:
-            sm = meta["StateManager"](min_consecutive=3)
-            smoothed = sm.run_batch(raw_states, raw_confs)
+        # Sub-sample for very large datasets
+        if len(windows) > MAX_WINDOWS:
+            step = len(windows) // MAX_WINDOWS
+            windows_proc = windows[::step]
         else:
-            smoothed = raw_states
+            windows_proc = windows
 
-    ss_set("windows_proc",    windows_proc)
-    ss_set("fft_cache",       fft_cache)
-    ss_set("val_results",     val_results)
-    ss_set("dataset_val",     dataset_val)
-    ss_set("features_cache",  features_cache)
-    ss_set("raw_states",      raw_states)
-    ss_set("smoothed_states", smoothed)
-    ss_set("win_centres",     get_window_timestamps(windows_proc))
-    ss_set("play_idx",        0)
-    ss_set("playing",         False)
+        with st.spinner(f"Computing FFT for {len(windows_proc)} windows…"):
+            fft_cache = meta["batch_fft"](windows_proc, sample_rate=sr)
+
+        with st.spinner("Engineering features…"):
+            features_cache = [meta["feat"](w.data, f) for w, f in zip(windows_proc, fft_cache)]
+
+        ss_set("windows_proc",   windows_proc)
+        ss_set("fft_cache",      fft_cache)
+        ss_set("features_cache", features_cache)
+        ss_set("win_centres",    get_window_timestamps(windows_proc))
+        ss_set("play_idx",       0)
+        ss_set("playing",        False)
+        # New windows invalidate anything derived from the old ones.
+        ss_set("val_results",     None)
+        ss_set("dataset_val",     None)
+        ss_set("raw_states",      None)
+        ss_set("smoothed_states", None)
+
+    windows_proc = ss("windows_proc")
+
+    if ss("val_results") is None:
+        with st.spinner("Validating windows…"):
+            val_results = [meta["val_win"](w.data, thresholds=ss("val_thr")) for w in windows_proc]
+            dataset_val = meta["val_ds"](windows_proc, thresholds=ss("val_thr"))
+        ss_set("val_results", val_results)
+        ss_set("dataset_val", dataset_val)
+
+    if ss("smoothed_states") is None:
+        features_cache = ss("features_cache")
+        with st.spinner("Classifying states…"):
+            raw_states = [meta["classify"](f, thresholds=ss("rag_thr")).state for f in features_cache]
+            raw_confs  = [meta["classify"](f, thresholds=ss("rag_thr")).confidence for f in features_cache]
+            if meta["StateManager"] is not None:
+                sm = meta["StateManager"](min_consecutive=3)
+                smoothed = sm.run_batch(raw_states, raw_confs)
+            else:
+                smoothed = raw_states
+        ss_set("raw_states",      raw_states)
+        ss_set("smoothed_states", smoothed)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -822,14 +856,18 @@ def page_validation():
         rag_view = df_view
 
     # ── Auto-run the pipeline end-to-end (no button) ───────────────────
-    # Re-runs automatically whenever the selected time range, window size or
-    # thresholds change (ss_invalidate / a new range signature clears results).
+    # A changed time range forces a full recompute (the windows themselves
+    # differ). A validation-threshold-only edit (val_results cleared by the
+    # sidebar, windows unchanged) is picked up by run_pipeline()'s own
+    # per-stage caching without touching windows/FFT/features.
     rag_sig = (
         len(rag_view),
         str(rag_view["timestamp"].iloc[0]) if len(rag_view) else "",
         str(rag_view["timestamp"].iloc[-1]) if len(rag_view) else "",
     )
-    if ss("windows_proc") is None or st.session_state[m].get("last_rag_sig") != rag_sig:
+    if st.session_state[m].get("last_rag_sig") != rag_sig:
+        ss_invalidate()
+    if ss("windows_proc") is None or ss("val_results") is None:
         run_pipeline(rag_view)
         ss_set("last_rag_sig", rag_sig)
         st.rerun()
@@ -1174,7 +1212,7 @@ def _page_load_analysis(m: str, meta: dict, sc: dict, sl: dict):
     """
     state_order = meta["state_order"]
 
-    if ss("smoothed_states") is None:
+    if ss("smoothed_states") is None or ss("val_results") is None:
         with st.spinner("Running load analysis pipeline…"):
             run_pipeline(_default_analysis_view(m, ss("df")))
         st.rerun()
@@ -1346,7 +1384,7 @@ def page_rag():
         return
 
     # ── Window-based machines: ensure the pipeline has been run ────────
-    if ss("smoothed_states") is None:
+    if ss("smoothed_states") is None or ss("val_results") is None:
         with st.spinner("Running analysis pipeline…"):
             run_pipeline(_default_analysis_view(m, ss("df")))
         st.rerun()
